@@ -10,13 +10,11 @@
 //! стороны гостевого приложения.
 
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::mem::{ConstPtr, MutVoidPtr, Ptr};
+use crate::mem::{ConstPtr, MutPtr, MutVoidPtr, Ptr};
 use crate::Environment;
 
-/// Псевдо-дескриптор для доступа к глобальной области видимости символов (main
-//executable).
-/// В операционных системах семейства Darwin/iOS RTLD_DEFAULT традиционно равен
-//(void*)-2.
+/// Псевдо-дескриптор для доступа к глобальной области видимости символов (main executable).
+/// В операционных системах семейства Darwin/iOS RTLD_DEFAULT традиционно равен (void*)-2.
 const RTLD_DEFAULT: MutVoidPtr = Ptr::from_bits(-2 as _);
 const RTLD_NEXT: MutVoidPtr = Ptr::from_bits(-1 as _);
 const RTLD_SELF: MutVoidPtr = Ptr::from_bits(-3 as _);
@@ -33,7 +31,7 @@ fn is_global_scope_handle(handle: MutVoidPtr) -> bool {
 }
 
 /// Проверяет, является ли запрашиваемая библиотека известной эмулятору
-//(присутствует в статическом списке DYLIB_LIST).
+/// (присутствует в статическом списке DYLIB_LIST).
 fn is_known_library(path: &str) -> bool {
     crate::dyld::DYLIB_LIST
         .iter()
@@ -42,9 +40,9 @@ fn is_known_library(path: &str) -> bool {
 
 /// Реализация функции `dlopen` стандарта POSIX.
 /// Загружает динамическую библиотеку в адресное пространство процесса (или
-//симулирует этот процесс в HLE).
+/// симулирует этот процесс в HLE).
 /// Возвращает дескриптор загруженной библиотеки или NULL в случае отсутствия
-//файла или ошибки чтения.
+/// файла или ошибки чтения.
 fn dlopen(env: &mut Environment, path: ConstPtr<u8>, _mode: i32) -> MutVoidPtr {
     // В соответствии со стандартом POSIX, вызов dlopen(NULL) возвращает
     // дескриптор главной программы.
@@ -85,18 +83,31 @@ fn dlopen(env: &mut Environment, path: ConstPtr<u8>, _mode: i32) -> MutVoidPtr {
         return Ptr::null();
     }
 
-    // Временная архитектура: использование указателя на строку пути в памяти
-    // гостя как непрозрачного дескриптора.
-    // TODO: Разработать защищенную систему управления дескрипторами (Handle
-    // Allocator Table) на стороне хоста,
-    // чтобы предотвратить уязвимости Use-After-Free, когда приложение
-    // освобождает строку пути после вызова dlopen.
-    path.cast_mut().cast()
+    // Находим зарегистрированный модуль HostDylib и выделяем персистентную память в госте.
+    // Это предотвращает Use-After-Free (UAF), когда гостевое приложение освобождает
+    // или перезаписывает оригинальный буфер пути после вызова dlopen.
+    if let Some(dylib) = crate::dyld::DYLIB_LIST
+        .iter()
+        .find(|d| d.path == path_str || d.aliases.contains(&path_str))
+    {
+        let handle_ptr = env.mem.alloc((dylib.path.len() + 1) as u32);
+        let mut addr = handle_ptr.to_bits();
+        for b in dylib.path.as_bytes() {
+            let p: MutPtr<u8> = MutPtr::from_bits(addr);
+            env.mem.write(p, *b);
+            addr += 1;
+        }
+        let p: MutPtr<u8> = MutPtr::from_bits(addr);
+        env.mem.write(p, 0u8);
+        return handle_ptr.cast();
+    }
+
+    Ptr::null()
 }
 
 /// Реализация функции `dlsym` стандарта POSIX.
 /// Выполняет поиск адреса экспортированного символа (функции или переменной) в
-//загруженном модуле.
+/// загруженном модуле.
 fn dlsym(env: &mut Environment, handle: MutVoidPtr, symbol: ConstPtr<u8>) -> MutVoidPtr {
     // БЕЗОПАСНОСТЬ: Валидация переданного дескриптора.
     // Специальные дескрипторы (RTLD_DEFAULT, RTLD_NEXT, RTLD_SELF,
@@ -171,7 +182,7 @@ fn dlsym(env: &mut Environment, handle: MutVoidPtr, symbol: ConstPtr<u8>) -> Mut
 
 /// Реализация функции `dlclose` стандарта POSIX.
 /// В HLE архитектуре выступает в роли заглушки, но строго соблюдает семантику
-//возврата кодов ошибок.
+/// возврата кодов ошибок.
 fn dlclose(env: &mut Environment, handle: MutVoidPtr) -> i32 {
     if is_global_scope_handle(handle) {
         return 0; // Операция успешна
